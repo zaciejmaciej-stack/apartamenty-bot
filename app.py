@@ -24,7 +24,7 @@ import random
 
 st.set_page_config(page_title="Autopilot Pro", page_icon="✈️", layout="wide")
 
-# --- CSS (Tylko dla Twoich zdjęć) ---
+# --- CSS ---
 st.markdown("""
 <style>
     [data-testid="stImage"] img { max-height: 600px; object-fit: cover; border-radius: 15px; }
@@ -38,120 +38,110 @@ def pobierz_twoje_zdjecia():
     if not os.path.exists(folder): return []
     return [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-async def parse_page_aggressive(page, radius, filters):
+async def scrape_safe(page):
     """
-    Nowa strategia: Szukamy wszystkich linków '/hotel/', a potem analizujemy ich rodziców.
+    Funkcja "Odkurzacz" - bierze wszystko jak leci, bez filtrowania.
     """
     results = []
+    
+    # Pobieramy wszystkie elementy, które mają w sobie cenę (najbardziej niezawodny znacznik)
+    # Szukamy po tekście "zł" lub "PLN" - to działa niezależnie od struktury HTML
+    price_elements = await page.query_selector_all(':text-matches("PLN|zł")')
+    
+    print(f"Znaleziono {len(price_elements)} elementów z walutą.")
+    
     seen_links = set()
-    
-    # 1. Pobierz wszystkie linki na stronie
-    # Szukamy linków, które w adresie mają słowo "hotel" - to zawsze działa
-    links = await page.query_selector_all('a[href*="/hotel/"]')
-    
-    print(f"Znaleziono {len(links)} potencjalnych linków do ofert.")
-    
-    for link_el in links:
+
+    for el in price_elements:
         try:
-            href = await link_el.get_attribute("href")
-            if not href: continue
+            # Wspinamy się w górę, żeby znaleźć kontener karty
+            card = await el.evaluate_handle('el => el.closest("div[data-testid=\'property-card\']") || el.closest("div[role=\'listitem\']") || el.parentElement.parentElement.parentElement')
+            if not card: continue
             
-            # Czysty link bez parametrów śledzących
-            clean_link = href.split('?')[0]
-            if clean_link in seen_links: continue
-            
-            # Pobieramy tekst całego kontenera (rodzica), w którym jest link
-            # Wspinamy się 3 poziomy w górę, żeby złapać cenę i nazwę
-            # To jest ryzykowne, ale skuteczne w chmurze
-            card_context = await link_el.evaluate_handle('el => el.closest("div[data-testid=\'property-card\']") || el.closest("div[role=\'listitem\']") || el.parentElement.parentElement.parentElement')
-            
-            if not card_context: continue
-            
-            full_text = await card_context.inner_text()
+            full_text = await card.inner_text()
             text_lower = full_text.lower()
             
             # --- CENA ---
             price_val = 0.0
-            # Szukamy liczb w sąsiedztwie "zł" lub "PLN"
             matches = re.findall(r'(?:PLN|zł)\s*([\d\s]+)|([\d\s]+)\s*(?:PLN|zł)', full_text, re.IGNORECASE)
             for m in matches:
                 val_str = m[0] if m[0] else m[1]
                 clean = re.sub(r'\s+', '', val_str)
                 if clean.isdigit():
-                    val = float(clean)
-                    if val > 50: # Odrzucamy śmieci poniżej 50 zł
-                        price_val = val
-                        break # Bierzemy pierwszą napotkaną (zazwyczaj główną) cenę
+                    v = float(clean)
+                    if v > 30: price_val = v; break
             
-            if price_val == 0: continue # Nie ma ceny = nie ma oferty
+            if price_val == 0: continue
+
+            # --- LINK ---
+            link_el = await card.query_selector('a')
+            link = "#"
+            if link_el:
+                href = await link_el.get_attribute("href")
+                if href: link = href.split('?')[0]
             
-            # --- DYSTANS ---
-            dist_val = 0.0
+            if link in seen_links: continue
+            seen_links.add(link)
+            
+            # --- NAZWA ---
+            name = "Oferta Booking"
+            title_el = await card.query_selector('[data-testid="title"], h3')
+            if title_el: name = await title_el.inner_text()
+
+            # --- DYSTANS (Bezpieczny) ---
+            dist_val = 999.0 # Domyślnie "daleko", jeśli nie uda się odczytać
+            dist_txt = "Brak danych"
+            
             dist_match = re.search(r'(\d+[.,]?\d*)\s*(km|m)\s', text_lower)
             if dist_match:
                 d_val = float(dist_match.group(1).replace(',', '.'))
                 unit = dist_match.group(2)
                 if unit == "km": dist_val = d_val
                 elif unit == "m": dist_val = d_val / 1000.0
-            
-            # --- FILTRY ---
-            if dist_val > radius: continue
-            if filters["parking"] and "parking" not in text_lower: continue
-            if filters["sniadanie"] and not any(x in text_lower for x in ["śniadanie", "breakfast", "wliczone"]): continue
-            if filters["klima"] and not any(x in text_lower for x in ["klimatyzacja", "klimatyzowany", "ac"]): continue
+                dist_txt = f"{dist_val:.2f} km"
 
-            # --- NAZWA ---
-            # Próbujemy znaleźć nagłówek w tym samym kontenerze
-            name = "Nieznany Obiekt"
-            # Szukamy elementu z dużą czcionką lub h3/h4
-            try:
-                name_el = await card_context.query_selector('h3, [data-testid="title"]')
-                if name_el: name = await name_el.inner_text()
-            except: pass
+            # --- UDOGODNIENIA (Do raportu) ---
+            has_ac = any(x in text_lower for x in ["klimatyzacja", "klimatyzowany", "ac"])
+            has_park = "parking" in text_lower
+            has_bfast = any(x in text_lower for x in ["śniadanie", "breakfast"])
 
-            seen_links.add(clean_link)
-            
-            if clean_link.startswith('http'): full_link = clean_link
-            else: full_link = f"https://www.booking.com{clean_link}"
+            if link.startswith('http'): full_link = link
+            else: full_link = f"https://www.booking.com{link}"
 
             results.append({
-                "price": price_val,
-                "dist": dist_val,
                 "name": name,
+                "price": price_val,
+                "dist_val": dist_val,
+                "dist_txt": dist_txt,
                 "link": full_link,
-                "text": text_lower # do debugu
+                "ac": has_ac,
+                "parking": has_park,
+                "breakfast": has_bfast
             })
-            
-        except Exception as e:
-            continue
 
+        except: continue
+        
     return results
 
 async def run_autopilot(address, radius, start_date, end_date, filters, progress_bar, status_text, image_spot, list_placeholder):
     twoje_fotki = pobierz_twoje_zdjecia()
     days = (end_date - start_date).days + 1
     daily_data = []
-    unique_competitors = {} 
+    all_raw_offers = [] # Tu trzymamy wszystko co znaleźliśmy
     
     async with async_playwright() as p:
-        # Ustawiamy dużą rozdzielczość (viewport), żeby Booking myślał, że to duży monitor
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox", 
-                "--disable-dev-shm-usage", 
-                "--disable-blink-features=AutomationControlled",
-                "--window-size=1920,1080"
-            ]
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
             locale="pl-PL"
         )
         page = await context.new_page()
 
-        status_text.info(f"🚀 Analizuję: {address}...")
+        status_text.info(f"🚀 Pobieram WSZYSTKIE oferty dla: {address}...")
 
         for i in range(days):
             progress_bar.progress((i + 1) / days)
@@ -173,30 +163,35 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
 
             try:
                 await page.goto(url, timeout=90000)
-                
-                # Zamykanie popupów
                 try: await page.click('#onetrust-accept-btn-handler', timeout=3000)
                 except: pass
                 
-                # Przewijanie (ważne!)
+                # Przewijanie
                 for _ in range(3):
-                    await page.evaluate("window.scrollBy(0, 1000)")
+                    await page.evaluate("window.scrollBy(0, 1500)")
                     await page.wait_for_timeout(1000)
 
-                # --- NOWA STRATEGIA AGRESYWNA ---
-                offers = await parse_page_aggressive(page, radius, filters)
+                # --- POBIERZ WSZYSTKO (BEZ FILTRÓW) ---
+                offers = await scrape_safe(page)
                 
+                # Teraz filtrujemy w Pythonie (bezpieczniej)
                 valid_prices = []
                 for o in offers:
-                    valid_prices.append(o["price"])
-                    if o["link"] not in unique_competitors:
-                        unique_competitors[o["link"]] = {
-                            "Nazwa": o["name"],
-                            "Link": o["link"],
-                            "Dystans": f"{o['dist']:.2f} km"
-                        }
+                    # Dodaj do ogólnej listy (nawet jeśli odrzucone, żebyś wiedział)
+                    all_raw_offers.append(o)
 
-                list_placeholder.caption(f"Znaleziono {len(unique_competitors)} unikalnych ofert...")
+                    # --- LOGIKA FILTRACJI ---
+                    # Dystans: Jeśli nie udało się odczytać (999), to PRZEPUSZCZAMY (lepiej pokazać za dużo niż nic)
+                    if o["dist_val"] != 999 and o["dist_val"] > radius: continue
+                    
+                    if filters["parking"] and not o["parking"]: continue
+                    if filters["sniadanie"] and not o["breakfast"]: continue
+                    if filters["klima"] and not o["ac"]: continue
+                    
+                    valid_prices.append(o["price"])
+
+                count_found = len(valid_prices)
+                list_placeholder.caption(f"Znaleziono {count_found} pasujących (z {len(offers)} pobranych).")
 
                 if valid_prices:
                     avg = int(sum(valid_prices) / len(valid_prices))
@@ -204,18 +199,16 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
                     suggested = int(avg * multiplier)
                     daily_data.append({
                         "Data": s1, "Dzień": current_date.strftime("%A"),
-                        "Liczba Ofert": len(valid_prices),
-                        "Średnia Rynkowa": avg, "Twoja Cena": suggested
+                        "Liczba Ofert": count_found, "Średnia Rynkowa": avg, "Twoja Cena": suggested
                     })
                 else:
                     daily_data.append({"Data": s1, "Dzień": current_date.strftime("%A"), "Liczba Ofert": 0, "Średnia Rynkowa": 0, "Twoja Cena": 0})
 
             except Exception as e:
-                print(f"Błąd przetwarzania: {e}")
+                print(f"Błąd: {e}")
 
         await browser.close()
-        competitors_list = list(unique_competitors.values())
-        return daily_data, competitors_list
+        return daily_data, all_raw_offers
 
 # --- UI START ---
 st.title("🎯 Asystent Cenowy")
@@ -226,8 +219,9 @@ col1, col2 = st.columns([1, 3])
 with col1:
     st.subheader("📍 Ustawienia")
     address = st.text_input("Adres:", "Szeroka 10, Toruń")
-    # Reset suwaka do 3.0 przez zmianę key/label
-    radius = st.number_input("Promień (km):", 0.1, 15.0, 3.0, 0.1)
+    
+    # SUWAK 3.0 KM - Odświeżony
+    radius = st.number_input("Maks. Dystans (km):", 0.1, 15.0, 3.0, 0.1, key="new_radius_slider")
     
     dates = st.date_input("Zakres dat:", (date.today(), date.today() + timedelta(days=7)))
     
@@ -254,34 +248,45 @@ if btn:
     else:
         filters = {"klima": f_klima, "parking": f_parking, "sniadanie": f_sniadanie}
         progress.progress(0)
-        dane_dni, dane_konkurencji = asyncio.run(run_autopilot(address, radius, dates[0], dates[1], filters, progress, status, img_spot, list_placeholder))
+        dane_dni, all_raw = asyncio.run(run_autopilot(address, radius, dates[0], dates[1], filters, progress, status, img_spot, list_placeholder))
         progress.progress(100)
         
         if dane_dni:
             df = pd.DataFrame(dane_dni)
-            df_comp = pd.DataFrame(dane_konkurencji)
             status.success("Gotowe!")
             
             st.subheader("Wykres")
             fig = px.line(df, x="Data", y=["Średnia Rynkowa", "Twoja Cena"], markers=True, color_discrete_map={"Średnia Rynkowa": "blue", "Twoja Cena": "red"})
             st.plotly_chart(fig, use_container_width=True)
             
-            st.subheader("Tabela")
+            st.subheader("Tabela Cen")
             st.dataframe(df, use_container_width=True)
             
-            if not df_comp.empty:
-                st.subheader("Lista Konkurencji")
-                st.dataframe(df_comp, column_config={"Link": st.column_config.LinkColumn("Link")}, use_container_width=True)
+            # --- TABELA WSZYSTKICH ZNALEZISK (Żebyś widział co bot pobiera) ---
+            if all_raw:
+                st.markdown("---")
+                st.subheader("🔍 Wszystkie Znalezione Oferty (Surowe Dane)")
+                st.caption("Jeśli ta lista jest pełna, a wykres pusty - poluzuj filtry.")
+                df_raw = pd.DataFrame(all_raw).drop_duplicates(subset=["link"])
+                st.dataframe(
+                    df_raw,
+                    column_config={
+                        "link": st.column_config.LinkColumn("Link"),
+                        "price": st.column_config.NumberColumn("Cena", format="%d zł"),
+                        "dist_txt": "Odległość (zczytana)"
+                    },
+                    use_container_width=True
+                )
             
             buffer = io.BytesIO()
             if file_format == "Excel (.xlsx)":
                 with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                     df.to_excel(writer, index=False, sheet_name='Kalendarz')
-                    if not df_comp.empty: df_comp.to_excel(writer, index=False, sheet_name='Konkurencja')
+                    if all_raw: pd.DataFrame(all_raw).drop_duplicates(subset=["link"]).to_excel(writer, index=False, sheet_name='Wszystkie_Oferty')
                 st.download_button("💾 Pobierz Raport (Excel)", buffer, "RAPORT.xlsx", "application/vnd.ms-excel")
             else:
                 c1, c2 = st.columns(2)
                 c1.download_button("💾 Kalendarz (CSV)", df.to_csv(index=False, sep=';').encode('utf-8-sig'), "KALENDARZ.csv", "text/csv")
-                if not df_comp.empty: c2.download_button("💾 Lista (CSV)", df_comp.to_csv(index=False, sep=';').encode('utf-8-sig'), "LISTA.csv", "text/csv")
+                if all_raw: c2.download_button("💾 Lista Ofert (CSV)", pd.DataFrame(all_raw).drop_duplicates(subset=["link"]).to_csv(index=False, sep=';').encode('utf-8-sig'), "LISTA.csv", "text/csv")
         else:
             status.error("Brak danych.")
