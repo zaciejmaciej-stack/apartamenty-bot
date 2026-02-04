@@ -1,24 +1,19 @@
 import streamlit as st
 import asyncio
-# --- AUTO-INSTALACJA PRZEGLĄDARKI (Fix dla Chmury) ---
 import os
 import subprocess
 import sys
 
-# Sprawdzamy, czy przeglądarka jest zainstalowana, jeśli nie - instalujemy ją
-# To kluczowy fragment, który naprawia błąd w Streamlit Cloud
+# --- AUTO-INSTALACJA (Fix dla Chmury) ---
 try:
     from playwright.async_api import async_playwright
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
 
-# Wymuszamy instalację silnika Chromium przy każdym starcie w chmurze
 if not os.path.exists("playwright_installed.flag"):
-    print("🚑 Instaluję przeglądarkę Chromium dla bota...")
+    print("🚑 Instaluję przeglądarkę Chromium...")
     subprocess.run(["playwright", "install", "chromium"])
-    # Tworzymy pusty plik, żeby nie instalować przy każdym odświeżeniu strony, tylko przy restarcie serwera
-    with open("playwright_installed.flag", "w") as f:
-        f.write("installed")
+    with open("playwright_installed.flag", "w") as f: f.write("installed")
 
 from datetime import date, timedelta
 import pandas as pd
@@ -32,11 +27,7 @@ st.set_page_config(page_title="Autopilot Pro", page_icon="✈️", layout="wide"
 # --- CSS ---
 st.markdown("""
 <style>
-    [data-testid="stImage"] img {
-        max-height: 600px;
-        object-fit: cover; 
-        border-radius: 15px;
-    }
+    [data-testid="stImage"] img { max-height: 600px; object-fit: cover; border-radius: 15px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -57,8 +48,7 @@ async def parse_card_content(card):
         if price_el:
             price_txt = await price_el.inner_text()
             info["price"] = float(re.sub(r'[^\d]', '', price_txt))
-        else:
-            return None 
+        else: return None 
             
         title_el = await card.query_selector('[data-testid="title"]')
         info["name"] = await title_el.inner_text() if title_el else "Obiekt"
@@ -75,10 +65,8 @@ async def parse_card_content(card):
                 val = float(nums[0].replace(',', '.'))
                 if "km" in dist_txt: info["dist_val"] = val
                 elif "m" in dist_txt: info["dist_val"] = val / 1000.0
-
         return info
-    except:
-        return None
+    except: return None
 
 async def run_autopilot(address, radius, start_date, end_date, filters, progress_bar, status_text, image_spot, list_placeholder):
     twoje_fotki = pobierz_twoje_zdjecia()
@@ -87,14 +75,19 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
     unique_competitors = {} 
     
     async with async_playwright() as p:
-        # --- KONFIGURACJA DLA CHMURY ---
+        # --- MASKOWANIE BOTA ---
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            args=[
+                "--no-sandbox", 
+                "--disable-dev-shm-usage", 
+                "--disable-blink-features=AutomationControlled" # Ukrywa fakt bycia robotem
+            ]
         )
         
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            locale="pl-PL"
         )
         page = await context.new_page()
 
@@ -116,18 +109,27 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
 
             url = (f"https://www.booking.com/searchresults.pl.html?ss={address}"
                    f"&checkin={s1}&checkout={s2}&group_adults=2&selected_currency=PLN"
-                   f"&order=distance_from_search")
+                   f"&order=distance_from_search&lang=pl")
 
             try:
                 await page.goto(url, timeout=60000)
                 
-                try: await page.click('#onetrust-accept-btn-handler', timeout=2000)
+                # Próba zamknięcia ciasteczek (częsta przyczyna "0 wyników")
+                try: await page.click('#onetrust-accept-btn-handler', timeout=3000)
                 except: pass
-
+                
+                # Przewijanie
                 await page.evaluate("window.scrollTo(0, 2000)")
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(3000) # Dłuższe czekanie w chmurze
 
                 cards = await page.query_selector_all('[data-testid="property-card"]')
+                
+                # --- DIAGNOSTYKA: JEŚLI 0 KART, ZRÓB ZDJĘCIE ---
+                if len(cards) == 0:
+                    status_text.warning(f"⚠️ Dzień {s1}: Brak wyników. Robię zdjęcie diagnostyczne...")
+                    await page.screenshot(path="debug_error.png")
+                    with image_spot.container():
+                        st.image("debug_error.png", caption="Co widzi bot (BŁĄD)", use_container_width=True)
                 
                 valid_prices = []
                 
@@ -154,7 +156,6 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
                     avg = int(sum(valid_prices) / len(valid_prices))
                     multiplier = 1.15 if current_date.weekday() in [4, 5] else 1.0
                     suggested = int(avg * multiplier)
-                    
                     daily_data.append({
                         "Data": s1, "Dzień": current_date.strftime("%A"),
                         "Liczba Ofert": len(valid_prices),
