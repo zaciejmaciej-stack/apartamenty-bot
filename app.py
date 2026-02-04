@@ -38,68 +38,59 @@ def pobierz_twoje_zdjecia():
     if not os.path.exists(folder): return []
     return [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-async def parse_card_content(card):
+async def parse_element_content(element):
+    """Uniwersalna funkcja parsująca dowolny element listy"""
     info = {}
     try:
-        full_text = await card.inner_text()
-        info["text"] = full_text.lower()
+        full_text = await element.inner_text()
+        text_lower = full_text.lower()
+        info["text"] = text_lower
         
-        # --- PANCERNE SZUKANIE CENY ---
-        price_val = None
+        # 1. CENA (Szukamy PLN/zł w tekście)
+        # Regex łapie: "200 zł", "PLN 200", "2 300 zł"
+        prices = re.findall(r'(?:PLN|zł)\s*([\d\s]+)|([\d\s]+)\s*(?:PLN|zł)', full_text, re.IGNORECASE)
+        found_price = 0
+        for p in prices:
+            val_str = p[0] if p[0] else p[1]
+            clean_val = re.sub(r'\s+', '', val_str)
+            if clean_val.isdigit():
+                val = float(clean_val)
+                # Odrzucamy liczby, które są rokiem (2024) lub małe (ocena 9)
+                if 30 < val < 50000: 
+                    found_price = val
+                    break
         
-        # Metoda 1: Standardowy selektor
-        price_el = await card.query_selector('[data-testid="price-and-discounted-price"]')
-        if price_el:
-            price_txt = await price_el.inner_text()
-            # Czyścimy wszystko co nie jest cyfrą
-            price_val = float(re.sub(r'[^\d]', '', price_txt))
-        
-        # Metoda 2: Jeśli Metoda 1 zawiodła, szukamy w całym tekście karty
-        if not price_val:
-            # Szukamy wzorców: "200 zł", "PLN 200", "200 PLN"
-            # Ignorujemy spacje w liczbach (np. 1 200)
-            matches = re.findall(r'(?:PLN|zł)\s*([\d\s]+)|([\d\s]+)\s*(?:PLN|zł)', full_text, re.IGNORECASE)
-            for m in matches:
-                # m to krotka np. ('', '1 200') lub ('200', '')
-                txt_val = m[0] if m[0] else m[1]
-                # Usuwamy spacje i sprawdzamy czy to sensowna liczba
-                clean_val = re.sub(r'\s+', '', txt_val)
-                if clean_val.isdigit():
-                    val = float(clean_val)
-                    if val > 10: # Ignorujemy małe liczby (np. ocena 9.0, dystans 2.5)
-                        price_val = val
-                        break
-
-        if price_val:
-            info["price"] = price_val
+        if found_price > 0:
+            info["price"] = found_price
         else:
-            return None # Bez ceny oferta jest bezużyteczna
-            
-        # Nazwa
-        title_el = await card.query_selector('[data-testid="title"]')
-        if not title_el: title_el = await card.query_selector('h3') 
-        info["name"] = await title_el.inner_text() if title_el else "Obiekt"
-        
-        # Link
-        link_el = await card.query_selector('a[data-testid="title-link"]')
-        if not link_el: link_el = await card.query_selector('a')
-        
+            return None # Bez ceny nie bierzemy
+
+        # 2. DYSTANS
+        info["dist_val"] = 0.0
+        # Szukamy fraz typu "1,5 km od centrum", "500 m od plaży"
+        dist_match = re.search(r'(\d+[.,]?\d*)\s*(km|m)\s', text_lower)
+        if dist_match:
+            val = float(dist_match.group(1).replace(',', '.'))
+            unit = dist_match.group(2)
+            if unit == "km": info["dist_val"] = val
+            elif unit == "m": info["dist_val"] = val / 1000.0
+
+        # 3. LINK i NAZWA
+        # Szukamy linku wewnątrz elementu
+        link_el = await element.query_selector('a')
         if link_el:
             href = await link_el.get_attribute("href")
             info["link"] = href.split('?')[0] if href else "#"
+            
+            # Próba pobrania nazwy z linku lub nagłówka
+            heading = await element.query_selector('[data-testid="title"], h3, h4, .sr-hotel__name')
+            if heading:
+                info["name"] = await heading.inner_text()
+            else:
+                info["name"] = "Oferta Booking"
         else:
             info["link"] = "#"
-        
-        # Dystans
-        info["dist_val"] = 0.0
-        distance_el = await card.query_selector('[data-testid="distance"]')
-        if distance_el:
-            dist_txt = await distance_el.inner_text()
-            nums = re.findall(r"(\d+[.,]?\d*)", dist_txt)
-            if nums:
-                val = float(nums[0].replace(',', '.'))
-                if "km" in dist_txt: info["dist_val"] = val
-                elif "m" in dist_txt: info["dist_val"] = val / 1000.0
+            info["name"] = "Oferta bez linku"
 
         return info
     except:
@@ -114,11 +105,7 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox", 
-                "--disable-dev-shm-usage", 
-                "--disable-blink-features=AutomationControlled"
-            ]
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
         )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -126,7 +113,7 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
         )
         page = await context.new_page()
 
-        status_text.info(f"🚀 Analizuję adres: {address}...")
+        status_text.info(f"🚀 Analizuję: {address}...")
 
         for i in range(days):
             progress_bar.progress((i + 1) / days)
@@ -147,61 +134,47 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
                    f"&order=distance_from_search&lang=pl")
 
             try:
-                await page.goto(url, timeout=90000) # Wydłużony timeout
+                await page.goto(url, timeout=60000)
                 
-                # Zamykanie popupów
-                try: 
-                    # Szukamy przycisków zawierających słowa kluczowe
-                    await page.click('button:has-text("Akceptuj")', timeout=2000)
-                    await page.click('button:has-text("Accept")', timeout=500)
+                # Zamykanie popupów (cicha próba)
+                try: await page.click('#onetrust-accept-btn-handler', timeout=2000)
                 except: pass
                 
-                # KLUCZOWE: Czekamy na "ciszę w sieci" (aż strona przestanie ładować dane)
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=10000)
-                except: pass # Jeśli timeout, idziemy dalej
-
+                # Przewijanie
                 await page.evaluate("window.scrollTo(0, 2000)")
                 await page.wait_for_timeout(2000)
 
-                # --- STRATEGIA ZBIERANIA KART (Potrójna) ---
-                cards = []
-                # 1. Standardowy ID
-                cards = await page.query_selector_all('[data-testid="property-card"]')
+                # --- NOWA STRATEGIA: Pobierz wszystkie możliwe kontenery ---
+                # Zamiast szukać konkretnych klas, szukamy wszystkich elementów listy wyników
+                elements = await page.query_selector_all('[data-testid="property-card"]')
                 
-                # 2. Jeśli pusto -> szukaj po roli
-                if not cards:
-                    cards = await page.query_selector_all('div[role="listitem"]')
+                # Jeśli standardowe karty nie działają, szukamy generycznych bloków
+                if not elements:
+                    elements = await page.query_selector_all('div[role="listitem"]')
                 
-                # 3. Jeśli nadal pusto -> szukaj kontenerów z cenami
-                if not cards:
-                    # Szukamy elementów, które mają w sobie cenę, i bierzemy ich rodzica (kartę)
-                    # To jest ryzykowne, ale tonący brzytwy się chwyta
-                    cards = await page.query_selector_all('.sr_item') # Stary selektor
+                # Jeśli nadal nic, szukamy po prostu bloków z ceną (ostateczność)
+                if not elements:
+                    # To bardzo szeroki selektor, ale w chmurze może być jedynym ratunkiem
+                    # Szukamy divów, które mają klasę zawierającą 'item' lub 'card'
+                    elements = await page.query_selector_all("div[class*='item'], div[class*='card']")
 
-                # DIAGNOSTYKA BŁĘDU (Zrzut ekranu jeśli 0 kart)
-                if not cards:
-                    status_text.warning(f"⚠️ Dzień {s1}: Nadal 0 kart. Robię zdjęcie do weryfikacji.")
-                    await page.screenshot(path="debug_error.png")
-                    with image_spot.container():
-                        st.image("debug_error.png", caption="Błąd: Brak widocznych ofert", use_container_width=True)
-                
                 valid_prices = []
                 
-                # Analizujemy znalezione karty
-                for c in cards[:50]: # Zwiększyłem limit do 50
-                    data = await parse_card_content(c)
+                # Skanujemy max 60 elementów (żeby nie muliło)
+                for el in elements[:60]:
+                    data = await parse_element_content(el)
                     if data:
-                        # Filtr dystansu
+                        # Filtr promienia
                         if data["dist_val"] > radius: continue
                         
-                        # Filtry tekstowe
+                        # Filtry udogodnień
                         if filters["parking"] and "parking" not in data["text"]: continue
                         if filters["sniadanie"] and not any(x in data["text"] for x in ["śniadanie", "breakfast", "wliczone"]): continue
                         if filters["klima"] and not any(x in data["text"] for x in ["klimatyzacja", "klimatyzowany", "ac"]): continue
                         
                         valid_prices.append(data["price"])
                         
+                        # Zapisujemy do listy konkurencji
                         if data["link"] not in unique_competitors:
                             link = data['link']
                             if link.startswith('http'): full_link = link
@@ -228,7 +201,7 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
                     daily_data.append({"Data": s1, "Dzień": current_date.strftime("%A"), "Liczba Ofert": 0, "Średnia Rynkowa": 0, "Twoja Cena": 0})
 
             except Exception as e:
-                print(f"Błąd: {e}")
+                print(f"Błąd przetwarzania: {e}")
 
         await browser.close()
         competitors_list = list(unique_competitors.values())
@@ -243,8 +216,10 @@ col1, col2 = st.columns([1, 3])
 with col1:
     st.subheader("📍 Ustawienia")
     address = st.text_input("Adres:", "Szeroka 10, Toruń")
-    # ZMIANA: Domyślna wartość 3.0
-    radius = st.number_input("Promień (km):", 0.1, 10.0, 3.0, 0.1)
+    
+    # ZMIANA: Zmieniony 'label' wymusi odświeżenie domyślnej wartości na 3.0
+    radius = st.number_input("Promień szukania (km):", 0.1, 15.0, 3.0, 0.1)
+    
     dates = st.date_input("Zakres dat:", (date.today(), date.today() + timedelta(days=7)))
     
     st.markdown("---")
@@ -276,7 +251,7 @@ if btn:
         if dane_dni:
             df = pd.DataFrame(dane_dni)
             df_comp = pd.DataFrame(dane_konkurencji)
-            status.success("Gotowe!")
+            status.success("Analiza zakończona!")
             
             st.subheader("Wykres")
             fig = px.line(df, x="Data", y=["Średnia Rynkowa", "Twoja Cena"], markers=True, color_discrete_map={"Średnia Rynkowa": "blue", "Twoja Cena": "red"})
@@ -300,4 +275,4 @@ if btn:
                 c1.download_button("💾 Kalendarz (CSV)", df.to_csv(index=False, sep=';').encode('utf-8-sig'), "KALENDARZ.csv", "text/csv")
                 if not df_comp.empty: c2.download_button("💾 Lista (CSV)", df_comp.to_csv(index=False, sep=';').encode('utf-8-sig'), "LISTA.csv", "text/csv")
         else:
-            status.error("Brak danych.")
+            status.error("Brak danych (lub Booking zablokował połączenie).")
