@@ -22,7 +22,7 @@ import plotly.express as px
 import io
 import re
 
-st.set_page_config(page_title="Autopilot Szpieg", page_icon="🕵️", layout="wide")
+st.set_page_config(page_title="Autopilot Linkowy", page_icon="🔗", layout="wide")
 
 # --- CSS ---
 st.markdown("""
@@ -38,52 +38,52 @@ def pobierz_twoje_zdjecia():
     if not os.path.exists(folder): return []
     return [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-async def scrape_stealth(page, radius, filters):
+async def scrape_by_links(page, radius):
+    """
+    Strategia: Znajdź wszystkie linki '/hotel/', weź ich rodzica i wyciągnij dane.
+    """
     results = []
-    
-    # Próba znalezienia czegokolwiek z ceną
-    price_elements = await page.query_selector_all(':text-matches("PLN|zł")')
-    
     seen_links = set()
-
-    for el in price_elements:
+    
+    # Szukamy WSZYSTKICH linków, które prowadzą do hotelu (polski i angielski URL)
+    # To jest najpewniejszy selektor, bo link musi istnieć, żeby user mógł kliknąć
+    links = await page.query_selector_all('a[href*="/hotel/"]')
+    
+    print(f"Znaleziono {len(links)} surowych linków.")
+    
+    for link_el in links:
         try:
-            # Szukamy rodzica elementu ceny
-            card = await el.evaluate_handle('el => el.closest("div[data-testid=\'property-card\']") || el.closest("div[role=\'listitem\']") || el.parentElement.parentElement.parentElement')
-            if not card: continue
+            href = await link_el.get_attribute("href")
+            if not href: continue
             
-            full_text = await card.inner_text()
+            # Czyścimy link
+            clean_link = href.split('?')[0]
+            if clean_link in seen_links: continue
+            
+            # Wspinamy się do rodzica (kontenera), żeby poszukać ceny obok linku
+            # Szukamy 3 poziomy w górę - to zazwyczaj obejmuje całą "kartę"
+            container = await link_el.evaluate_handle('el => el.parentElement.parentElement.parentElement')
+            if not container: continue
+            
+            full_text = await container.inner_text()
             text_lower = full_text.lower()
             
-            # Cena
+            # --- CENA (Szukamy liczb obok PLN/zł) ---
             price_val = 0.0
+            # Regex szuka: "200 zł", "PLN 200", "2 400 zł"
             matches = re.findall(r'(?:PLN|zł)\s*([\d\s]+)|([\d\s]+)\s*(?:PLN|zł)', full_text, re.IGNORECASE)
             for m in matches:
                 val_str = m[0] if m[0] else m[1]
                 clean = re.sub(r'\s+', '', val_str)
                 if clean.isdigit():
                     v = float(clean)
-                    if v > 30: price_val = v; break
+                    if v > 50: price_val = v; break # Ignorujemy małe liczby
             
+            # Jeśli nie znaleziono ceny przy linku, to pewnie link do zdjęcia albo mapy - pomijamy
             if price_val == 0: continue
 
-            # Link
-            link_el = await card.query_selector('a')
-            link = "#"
-            if link_el:
-                href = await link_el.get_attribute("href")
-                if href: link = href.split('?')[0]
-            
-            if link in seen_links: continue
-            seen_links.add(link)
-            
-            # Nazwa
-            name = "Oferta"
-            title_el = await card.query_selector('[data-testid="title"], h3')
-            if title_el: name = await title_el.inner_text()
-
-            # Dystans
-            dist_val = 999.0
+            # --- DYSTANS ---
+            dist_val = 0.0 # Domyślnie 0, żeby nie odrzucić, jeśli nie znajdziemy
             dist_match = re.search(r'(\d+[.,]?\d*)\s*(km|m)\s', text_lower)
             if dist_match:
                 d_val = float(dist_match.group(1).replace(',', '.'))
@@ -91,23 +91,39 @@ async def scrape_stealth(page, radius, filters):
                 if unit == "km": dist_val = d_val
                 elif unit == "m": dist_val = d_val / 1000.0
 
-            # Filtry
-            if dist_val != 999.0 and dist_val > radius: continue
-            if filters["parking"] and "parking" not in text_lower: continue
-            if filters["sniadanie"] and not any(x in text_lower for x in ["śniadanie", "breakfast"]): continue
-            if filters["klima"] and not any(x in text_lower for x in ["klimatyzacja", "ac", "klimatyzowany"]): continue
+            # --- NAZWA ---
+            name = "Oferta"
+            # Próbujemy znaleźć nagłówek w tym samym kontenerze
+            try:
+                # Szukamy jakiegokolwiek nagłówka h3 lub div-a z klasą tytułu
+                name_el = await container.query_selector('h3, [data-testid="title"]')
+                if name_el:
+                    name = await name_el.inner_text()
+                else:
+                    # Jeśli nie ma nagłówka, bierzemy pierwsze 30 znaków tekstu linku
+                    name = (await link_el.inner_text())[:30]
+            except: pass
 
-            if link.startswith('http'): full_link = link
-            else: full_link = f"https://www.booking.com{link}"
+            seen_links.add(clean_link)
+            
+            if clean_link.startswith('http'): full_link = clean_link
+            else: full_link = f"https://www.booking.com{clean_link}"
+            
+            # --- UDOGODNIENIA (Text search) ---
+            ac = any(x in text_lower for x in ["klimatyzacja", "ac", "klimatyzowany"])
+            park = "parking" in text_lower
+            bfast = any(x in text_lower for x in ["śniadanie", "breakfast"])
 
             results.append({
                 "name": name,
                 "price": price_val,
                 "dist": dist_val,
-                "link": full_link
+                "link": full_link,
+                "ac": ac, "parking": park, "breakfast": bfast
             })
+            
         except: continue
-        
+
     return results
 
 async def run_autopilot(address, radius, start_date, end_date, filters, progress_bar, status_text, image_spot, list_placeholder, debug_area):
@@ -116,32 +132,22 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
     daily_data = []
     
     async with async_playwright() as p:
-        # --- MASKOWANIE POZIOM EKSPERT ---
+        # Start przeglądarki z flagami anty-botowymi
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox", 
-                "--disable-blink-features=AutomationControlled", # Ukrywa flagę robota
-                "--disable-infobars",
-                "--window-size=1920,1080"
-            ]
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled", "--window-size=1920,1080"]
         )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
             locale="pl-PL"
         )
-        
-        # SKRYPT JS: Usuwa ślady Playwrighta ze strony
-        await context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-        """)
+        # Usuwamy 'webdriver' property
+        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
         page = await context.new_page()
 
-        status_text.info(f"🕵️ Rozpoczynam misję dla: {address}")
+        status_text.info(f"🕵️ Skanuję linki dla: {address}")
 
         for i in range(days):
             progress_bar.progress((i + 1) / days)
@@ -157,44 +163,49 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
                     fotka = random.choice(twoje_fotki)
                     st.image(fotka, caption=f"Twój Apartament - {s1}", use_container_width=True)
 
-            # URL
             url = (f"https://www.booking.com/searchresults.pl.html?ss={address}"
                    f"&checkin={s1}&checkout={s2}&group_adults=2&selected_currency=PLN"
                    f"&order=distance_from_search&lang=pl")
 
             try:
-                await page.goto(url, timeout=90000)
-                
-                # Zamykanie popupów
+                await page.goto(url, timeout=60000)
                 try: await page.click('#onetrust-accept-btn-handler', timeout=3000)
                 except: pass
 
-                # Przewijanie
-                await page.evaluate("window.scrollTo(0, 1000)")
-                await page.wait_for_timeout(2000)
+                # --- AGRESYWNE PRZEWIJANIE KLAWIATURĄ ---
+                # To często działa lepiej niż JS scroll w chmurze
+                for _ in range(5):
+                    await page.keyboard.press("End")
+                    await page.wait_for_timeout(1000)
                 
-                # --- POBIERANIE ---
-                offers = await scrape_stealth(page, radius, filters)
+                # --- POBIERANIE PO LINKACH ---
+                offers = await scrape_by_links(page, radius)
                 
-                # --- DIAGNOSTYKA TEKSTOWA ---
-                # Jeśli 0 wyników, pokażemy użytkownikowi kawałek tekstu strony
-                if not offers:
-                    body_text = await page.inner_text('body')
-                    # Czyścimy tekst z pustych linii
-                    clean_text = "\n".join([line for line in body_text.split('\n') if line.strip()][:20])
-                    debug_area.error(f"⚠️ Dzień {s1}: Brak ofert. Oto co widzi bot na początku strony:")
-                    debug_area.code(clean_text)
+                # Debug: Pokaż co znalazł, nawet jeśli odrzuci filtr
+                if offers:
+                    debug_text = ", ".join([o['name'] for o in offers[:5]])
+                    debug_area.caption(f"🔍 Widzę m.in.: {debug_text}...")
+                else:
+                    debug_area.error("⚠️ Bot nie widzi linków '/hotel/'. Prawdopodobnie inna struktura strony.")
 
-                valid_prices = [o["price"] for o in offers]
+                valid_prices = []
+                for o in offers:
+                    # Filtry (jeśli dystans=0 to znaczy że nie znaleziono, więc przepuszczamy dla bezpieczeństwa)
+                    if o["dist"] > 0 and o["dist"] > radius: continue
+                    if filters["parking"] and not o["parking"]: continue
+                    if filters["sniadanie"] and not o["breakfast"]: continue
+                    if filters["klima"] and not o["ac"]: continue
+                    
+                    valid_prices.append(o["price"])
 
+                count = len(valid_prices)
                 if valid_prices:
-                    avg = int(sum(valid_prices) / len(valid_prices))
+                    avg = int(sum(valid_prices) / count)
                     multiplier = 1.15 if current_date.weekday() in [4, 5] else 1.0
                     suggested = int(avg * multiplier)
                     daily_data.append({
                         "Data": s1, "Dzień": current_date.strftime("%A"),
-                        "Liczba Ofert": len(valid_prices),
-                        "Średnia Rynkowa": avg, "Twoja Cena": suggested
+                        "Liczba Ofert": count, "Średnia Rynkowa": avg, "Twoja Cena": suggested
                     })
                 else:
                     daily_data.append({"Data": s1, "Dzień": current_date.strftime("%A"), "Liczba Ofert": 0, "Średnia Rynkowa": 0, "Twoja Cena": 0})
@@ -206,7 +217,7 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
         return daily_data
 
 # --- UI START ---
-st.title("🕵️ Asystent Szpieg")
+st.title("🔗 Asystent Linkowy")
 st.markdown("---")
 
 col1, col2 = st.columns([1, 3])
@@ -227,9 +238,7 @@ with col1:
     
     st.markdown("---")
     btn = st.button("🚀 URUCHOM ANALIZĘ", type="primary")
-    
-    st.markdown("---")
-    debug_area = st.empty() # Miejsce na komunikaty błędu
+    debug_area = st.empty()
 
 with col2:
     status = st.empty()
@@ -243,15 +252,12 @@ if btn:
         filters = {"klima": f_klima, "parking": f_parking, "sniadanie": f_sniadanie}
         progress.progress(0)
         
-        # Czyścimy debug area
-        debug_area.empty()
-        
         dane_dni = asyncio.run(run_autopilot(address, radius, dates[0], dates[1], filters, progress, status, img_spot, st.empty(), debug_area))
         progress.progress(100)
         
         if dane_dni:
             df = pd.DataFrame(dane_dni)
-            status.success("Gotowe!")
+            status.success("Zakończono!")
             
             st.subheader("Wykres")
             fig = px.line(df, x="Data", y=["Średnia Rynkowa", "Twoja Cena"], markers=True, color_discrete_map={"Średnia Rynkowa": "blue", "Twoja Cena": "red"})
