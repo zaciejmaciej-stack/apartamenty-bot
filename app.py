@@ -22,7 +22,7 @@ import plotly.express as px
 import io
 import re
 
-st.set_page_config(page_title="Autopilot Linkowy", page_icon="🔗", layout="wide")
+st.set_page_config(page_title="Autopilot Brutalny", page_icon="🦖", layout="wide")
 
 # --- CSS ---
 st.markdown("""
@@ -38,91 +38,77 @@ def pobierz_twoje_zdjecia():
     if not os.path.exists(folder): return []
     return [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-async def scrape_by_links(page, radius):
+async def scrape_brutal(page):
     """
-    Strategia: Znajdź wszystkie linki '/hotel/', weź ich rodzica i wyciągnij dane.
+    Metoda Brutalna: Pobiera surowy tekst ze wszystkich elementów div
+    i szuka wzorców cenowych, ignorując strukturę HTML.
     """
     results = []
-    seen_links = set()
     
-    # Szukamy WSZYSTKICH linków, które prowadzą do hotelu (polski i angielski URL)
-    # To jest najpewniejszy selektor, bo link musi istnieć, żeby user mógł kliknąć
-    links = await page.query_selector_all('a[href*="/hotel/"]')
+    # Pobieramy wszystkie bloki tekstu, które mogą być ofertami
+    # Szukamy elementów, które zawierają "zł" lub "PLN"
+    elements = await page.query_selector_all('div:has-text("zł"), div:has-text("PLN")')
     
-    print(f"Znaleziono {len(links)} surowych linków.")
-    
-    for link_el in links:
+    # Odsiewamy te, które są zbyt duże (cała strona) lub zbyt małe
+    potential_cards = []
+    for el in elements:
         try:
-            href = await link_el.get_attribute("href")
-            if not href: continue
-            
-            # Czyścimy link
-            clean_link = href.split('?')[0]
-            if clean_link in seen_links: continue
-            
-            # Wspinamy się do rodzica (kontenera), żeby poszukać ceny obok linku
-            # Szukamy 3 poziomy w górę - to zazwyczaj obejmuje całą "kartę"
-            container = await link_el.evaluate_handle('el => el.parentElement.parentElement.parentElement')
-            if not container: continue
-            
-            full_text = await container.inner_text()
-            text_lower = full_text.lower()
-            
-            # --- CENA (Szukamy liczb obok PLN/zł) ---
-            price_val = 0.0
-            # Regex szuka: "200 zł", "PLN 200", "2 400 zł"
-            matches = re.findall(r'(?:PLN|zł)\s*([\d\s]+)|([\d\s]+)\s*(?:PLN|zł)', full_text, re.IGNORECASE)
-            for m in matches:
-                val_str = m[0] if m[0] else m[1]
-                clean = re.sub(r'\s+', '', val_str)
-                if clean.isdigit():
-                    v = float(clean)
-                    if v > 50: price_val = v; break # Ignorujemy małe liczby
-            
-            # Jeśli nie znaleziono ceny przy linku, to pewnie link do zdjęcia albo mapy - pomijamy
-            if price_val == 0: continue
+            # Sprawdzamy czy to liść (nie ma zbyt wielu dzieci) lub mała karta
+            text = await el.inner_text()
+            if len(text) < 500 and len(text) > 20: # Rozsądna długość opisu oferty
+                potential_cards.append(text)
+        except: pass
+        
+    # Usuwamy duplikaty (bo div jest w divie)
+    unique_texts = list(set(potential_cards))
+    
+    print(f"Znaleziono {len(unique_texts)} bloków tekstu z walutą.")
 
-            # --- DYSTANS ---
-            dist_val = 0.0 # Domyślnie 0, żeby nie odrzucić, jeśli nie znajdziemy
-            dist_match = re.search(r'(\d+[.,]?\d*)\s*(km|m)\s', text_lower)
-            if dist_match:
-                d_val = float(dist_match.group(1).replace(',', '.'))
-                unit = dist_match.group(2)
-                if unit == "km": dist_val = d_val
-                elif unit == "m": dist_val = d_val / 1000.0
+    for text in unique_texts:
+        text_lower = text.lower()
+        
+        # 1. CENA
+        price_val = 0.0
+        matches = re.findall(r'(?:PLN|zł)\s*([\d\s]+)|([\d\s]+)\s*(?:PLN|zł)', text, re.IGNORECASE)
+        for m in matches:
+            val_str = m[0] if m[0] else m[1]
+            clean = re.sub(r'\s+', '', val_str)
+            if clean.isdigit():
+                v = float(clean)
+                if v > 50: price_val = v; break
+        
+        if price_val == 0: continue
 
-            # --- NAZWA ---
-            name = "Oferta"
-            # Próbujemy znaleźć nagłówek w tym samym kontenerze
-            try:
-                # Szukamy jakiegokolwiek nagłówka h3 lub div-a z klasą tytułu
-                name_el = await container.query_selector('h3, [data-testid="title"]')
-                if name_el:
-                    name = await name_el.inner_text()
-                else:
-                    # Jeśli nie ma nagłówka, bierzemy pierwsze 30 znaków tekstu linku
-                    name = (await link_el.inner_text())[:30]
-            except: pass
+        # 2. DYSTANS
+        dist_val = 0.0
+        dist_match = re.search(r'(\d+[.,]?\d*)\s*(km|m)\s', text_lower)
+        if dist_match:
+            d_val = float(dist_match.group(1).replace(',', '.'))
+            unit = dist_match.group(2)
+            if unit == "km": dist_val = d_val
+            elif unit == "m": dist_val = d_val / 1000.0
+            
+        # 3. NAZWA (Bierzemy pierwszą linię tekstu jako nazwę)
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        name = lines[0] if lines else "Oferta"
+        if len(name) > 50: name = name[:50] + "..."
 
-            seen_links.add(clean_link)
-            
-            if clean_link.startswith('http'): full_link = clean_link
-            else: full_link = f"https://www.booking.com{clean_link}"
-            
-            # --- UDOGODNIENIA (Text search) ---
-            ac = any(x in text_lower for x in ["klimatyzacja", "ac", "klimatyzowany"])
-            park = "parking" in text_lower
-            bfast = any(x in text_lower for x in ["śniadanie", "breakfast"])
+        # 4. LINK (Tworzymy sztuczny, bo brutalny scraping gubi kontekst linku)
+        full_link = f"https://www.booking.com/searchresults.pl.html?ss={name}"
 
-            results.append({
-                "name": name,
-                "price": price_val,
-                "dist": dist_val,
-                "link": full_link,
-                "ac": ac, "parking": park, "breakfast": bfast
-            })
-            
-        except: continue
+        # 5. UDOGODNIENIA
+        ac = any(x in text_lower for x in ["klimatyzacja", "ac", "klimatyzowany"])
+        park = "parking" in text_lower
+        bfast = any(x in text_lower for x in ["śniadanie", "breakfast"])
+
+        results.append({
+            "name": name,
+            "price": price_val,
+            "dist": dist_val,
+            "link": full_link, # Link do wyszukiwania tej nazwy
+            "ac": ac, "parking": park, "breakfast": bfast,
+            "raw": text[:50] # debug
+        })
 
     return results
 
@@ -132,22 +118,19 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
     daily_data = []
     
     async with async_playwright() as p:
-        # Start przeglądarki z flagami anty-botowymi
+        # EMULACJA IPHONE'A - To często omija blokady desktopowe!
+        iphone = p.devices['iPhone 13']
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled", "--window-size=1920,1080"]
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080},
+            **iphone,
             locale="pl-PL"
         )
-        # Usuwamy 'webdriver' property
-        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        
         page = await context.new_page()
 
-        status_text.info(f"🕵️ Skanuję linki dla: {address}")
+        status_text.info(f"🦖 Tryb Brutalny: {address}")
 
         for i in range(days):
             progress_bar.progress((i + 1) / days)
@@ -169,29 +152,34 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
 
             try:
                 await page.goto(url, timeout=60000)
-                try: await page.click('#onetrust-accept-btn-handler', timeout=3000)
+                
+                # DIAGNOSTYKA: POKAŻ TYTUŁ STRONY
+                page_title = await page.title()
+                debug_area.info(f"🔍 Tytuł strony (Dzień {i+1}): {page_title}")
+                
+                # Zamykanie
+                try: await page.click('button', timeout=1000) # Kliknij cokolwiek co jest przyciskiem (często zamyka popupy na mobile)
                 except: pass
 
-                # --- AGRESYWNE PRZEWIJANIE KLAWIATURĄ ---
-                # To często działa lepiej niż JS scroll w chmurze
-                for _ in range(5):
-                    await page.keyboard.press("End")
-                    await page.wait_for_timeout(1000)
+                # Scroll
+                await page.evaluate("window.scrollTo(0, 5000)")
+                await page.wait_for_timeout(2000)
                 
-                # --- POBIERANIE PO LINKACH ---
-                offers = await scrape_by_links(page, radius)
+                # --- POBIERANIE BRUTALNE ---
+                offers = await scrape_brutal(page)
                 
-                # Debug: Pokaż co znalazł, nawet jeśli odrzuci filtr
-                if offers:
-                    debug_text = ", ".join([o['name'] for o in offers[:5]])
-                    debug_area.caption(f"🔍 Widzę m.in.: {debug_text}...")
-                else:
-                    debug_area.error("⚠️ Bot nie widzi linków '/hotel/'. Prawdopodobnie inna struktura strony.")
+                if not offers:
+                    # Jeśli nadal nic, zrzucamy źródło strony do pliku
+                    html_content = await page.content()
+                    with open(f"debug_source_{s1}.html", "w") as f:
+                        f.write(html_content)
+                    debug_area.error(f"⚠️ Nadal 0. Pobrano kod strony do analizy (debug_source_{s1}.html). Tytuł: {page_title}")
 
                 valid_prices = []
                 for o in offers:
-                    # Filtry (jeśli dystans=0 to znaczy że nie znaleziono, więc przepuszczamy dla bezpieczeństwa)
+                    # IGNORUJEMY FILTR DYSTANSU JEŚLI JEST 0 (żeby cokolwiek pokazać)
                     if o["dist"] > 0 and o["dist"] > radius: continue
+                    
                     if filters["parking"] and not o["parking"]: continue
                     if filters["sniadanie"] and not o["breakfast"]: continue
                     if filters["klima"] and not o["ac"]: continue
@@ -199,6 +187,8 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
                     valid_prices.append(o["price"])
 
                 count = len(valid_prices)
+                list_placeholder.caption(f"Znaleziono {count} (z {len(offers)} surowych).")
+
                 if valid_prices:
                     avg = int(sum(valid_prices) / count)
                     multiplier = 1.15 if current_date.weekday() in [4, 5] else 1.0
@@ -217,7 +207,7 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
         return daily_data
 
 # --- UI START ---
-st.title("🔗 Asystent Linkowy")
+st.title("🦖 Asystent Brutalny")
 st.markdown("---")
 
 col1, col2 = st.columns([1, 3])
@@ -237,7 +227,7 @@ with col1:
     file_format = st.radio("Format pliku:", ["Excel (.xlsx)", "Numbers (.csv)"])
     
     st.markdown("---")
-    btn = st.button("🚀 URUCHOM ANALIZĘ", type="primary")
+    btn = st.button("🚀 URUCHOM", type="primary")
     debug_area = st.empty()
 
 with col2:
