@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 
-# --- AUTO-INSTALACJA (Fix dla Chmury) ---
+# --- AUTO-INSTALACJA ---
 try:
     from playwright.async_api import async_playwright
 except ImportError:
@@ -44,18 +44,41 @@ async def parse_card_content(card):
         full_text = await card.inner_text()
         info["text"] = full_text.lower()
         
+        # --- BARDZIEJ ELASTYCZNE SZUKANIE CENY ---
+        # Szukamy czegokolwiek co ma cyfry i "zł" lub "PLN"
+        price_txt = None
+        # Metoda 1: Standardowy selektor
         price_el = await card.query_selector('[data-testid="price-and-discounted-price"]')
         if price_el:
             price_txt = await price_el.inner_text()
+        else:
+            # Metoda 2: Szukanie po tekście wewnątrz karty (Regex)
+            # Szuka ciągu typu: "1 200 zł" lub "450PLN"
+            match = re.search(r'(\d[\d\s]*)(zł|PLN)', full_text, re.IGNORECASE)
+            if match:
+                price_txt = match.group(0)
+
+        if price_txt:
             info["price"] = float(re.sub(r'[^\d]', '', price_txt))
-        else: return None 
+        else:
+            return None # Bez ceny nie bierzemy
             
+        # Nazwa
         title_el = await card.query_selector('[data-testid="title"]')
-        info["name"] = await title_el.inner_text() if title_el else "Obiekt"
+        if not title_el: title_el = await card.query_selector('h3') # Fallback na nagłówek
+        info["name"] = await title_el.inner_text() if title_el else "Obiekt bez nazwy"
         
+        # Link
         link_el = await card.query_selector('a[data-testid="title-link"]')
-        info["link"] = link_el.get_attribute("href").split('?')[0] if link_el else "#"
+        if not link_el: link_el = await card.query_selector('a') # Pierwszy link w karcie
         
+        if link_el:
+            href = await link_el.get_attribute("href")
+            info["link"] = href.split('?')[0] if href else "#"
+        else:
+            info["link"] = "#"
+        
+        # Dystans
         distance_el = await card.query_selector('[data-testid="distance"]')
         info["dist_val"] = 0.0
         if distance_el:
@@ -65,8 +88,10 @@ async def parse_card_content(card):
                 val = float(nums[0].replace(',', '.'))
                 if "km" in dist_txt: info["dist_val"] = val
                 elif "m" in dist_txt: info["dist_val"] = val / 1000.0
+
         return info
-    except: return None
+    except:
+        return None
 
 async def run_autopilot(address, radius, start_date, end_date, filters, progress_bar, status_text, image_spot, list_placeholder):
     twoje_fotki = pobierz_twoje_zdjecia()
@@ -75,16 +100,10 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
     unique_competitors = {} 
     
     async with async_playwright() as p:
-        # --- MASKOWANIE BOTA ---
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox", 
-                "--disable-dev-shm-usage", 
-                "--disable-blink-features=AutomationControlled" # Ukrywa fakt bycia robotem
-            ]
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
         )
-        
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             locale="pl-PL"
@@ -114,22 +133,34 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
             try:
                 await page.goto(url, timeout=60000)
                 
-                # Próba zamknięcia ciasteczek (częsta przyczyna "0 wyników")
+                # Zamknięcie ciasteczek
                 try: await page.click('#onetrust-accept-btn-handler', timeout=3000)
                 except: pass
-                
-                # Przewijanie
-                await page.evaluate("window.scrollTo(0, 2000)")
-                await page.wait_for_timeout(3000) # Dłuższe czekanie w chmurze
 
+                # Czekamy na załadowanie DOM (struktury strony)
+                await page.wait_for_load_state("domcontentloaded")
+                
+                # Scrollujemy powoli, żeby wywołać ładowanie elementów
+                await page.evaluate("window.scrollTo(0, 1000)")
+                await page.wait_for_timeout(1000)
+                await page.evaluate("window.scrollTo(0, 2000)")
+                await page.wait_for_timeout(2000)
+
+                # --- NOWA STRATEGIA POBIERANIA KART ---
+                # Próbujemy znaleźć cokolwiek co wygląda jak karta
                 cards = await page.query_selector_all('[data-testid="property-card"]')
                 
-                # --- DIAGNOSTYKA: JEŚLI 0 KART, ZRÓB ZDJĘCIE ---
+                # Jeśli standardowa metoda zawiedzie, szukamy po roli (listitem)
                 if len(cards) == 0:
-                    status_text.warning(f"⚠️ Dzień {s1}: Brak wyników. Robię zdjęcie diagnostyczne...")
+                    status_text.info("⚠️ Próbuję alternatywnej metody szukania...")
+                    cards = await page.query_selector_all('div[role="listitem"]')
+                
+                # DIAGNOSTYKA
+                if len(cards) == 0:
+                    status_text.error(f"⚠️ Dzień {s1}: Nadal 0 kart. Robię zdjęcie błędu.")
                     await page.screenshot(path="debug_error.png")
                     with image_spot.container():
-                        st.image("debug_error.png", caption="Co widzi bot (BŁĄD)", use_container_width=True)
+                        st.image("debug_error.png", caption="Nadal brak wyników", use_container_width=True)
                 
                 valid_prices = []
                 
@@ -144,9 +175,13 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
                         valid_prices.append(data["price"])
                         
                         if data["link"] not in unique_competitors:
+                            link = data['link']
+                            if link.startswith('http'): full_link = link
+                            else: full_link = f"https://www.booking.com{link}"
+                                
                             unique_competitors[data["link"]] = {
                                 "Nazwa": data["name"],
-                                "Link": f"https://www.booking.com{data['link']}" if not data['link'].startswith('http') else data['link'],
+                                "Link": full_link,
                                 "Dystans": f"{data['dist_val']:.2f} km"
                             }
 
