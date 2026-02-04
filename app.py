@@ -24,7 +24,7 @@ import random
 
 st.set_page_config(page_title="Autopilot Pro", page_icon="✈️", layout="wide")
 
-# --- CSS ---
+# --- CSS (Tylko dla Twoich zdjęć) ---
 st.markdown("""
 <style>
     [data-testid="stImage"] img { max-height: 600px; object-fit: cover; border-radius: 15px; }
@@ -38,63 +38,94 @@ def pobierz_twoje_zdjecia():
     if not os.path.exists(folder): return []
     return [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-async def parse_element_content(element):
-    """Uniwersalna funkcja parsująca dowolny element listy"""
-    info = {}
-    try:
-        full_text = await element.inner_text()
-        text_lower = full_text.lower()
-        info["text"] = text_lower
-        
-        # 1. CENA (Szukamy PLN/zł w tekście)
-        # Regex łapie: "200 zł", "PLN 200", "2 300 zł"
-        prices = re.findall(r'(?:PLN|zł)\s*([\d\s]+)|([\d\s]+)\s*(?:PLN|zł)', full_text, re.IGNORECASE)
-        found_price = 0
-        for p in prices:
-            val_str = p[0] if p[0] else p[1]
-            clean_val = re.sub(r'\s+', '', val_str)
-            if clean_val.isdigit():
-                val = float(clean_val)
-                # Odrzucamy liczby, które są rokiem (2024) lub małe (ocena 9)
-                if 30 < val < 50000: 
-                    found_price = val
-                    break
-        
-        if found_price > 0:
-            info["price"] = found_price
-        else:
-            return None # Bez ceny nie bierzemy
-
-        # 2. DYSTANS
-        info["dist_val"] = 0.0
-        # Szukamy fraz typu "1,5 km od centrum", "500 m od plaży"
-        dist_match = re.search(r'(\d+[.,]?\d*)\s*(km|m)\s', text_lower)
-        if dist_match:
-            val = float(dist_match.group(1).replace(',', '.'))
-            unit = dist_match.group(2)
-            if unit == "km": info["dist_val"] = val
-            elif unit == "m": info["dist_val"] = val / 1000.0
-
-        # 3. LINK i NAZWA
-        # Szukamy linku wewnątrz elementu
-        link_el = await element.query_selector('a')
-        if link_el:
+async def parse_page_aggressive(page, radius, filters):
+    """
+    Nowa strategia: Szukamy wszystkich linków '/hotel/', a potem analizujemy ich rodziców.
+    """
+    results = []
+    seen_links = set()
+    
+    # 1. Pobierz wszystkie linki na stronie
+    # Szukamy linków, które w adresie mają słowo "hotel" - to zawsze działa
+    links = await page.query_selector_all('a[href*="/hotel/"]')
+    
+    print(f"Znaleziono {len(links)} potencjalnych linków do ofert.")
+    
+    for link_el in links:
+        try:
             href = await link_el.get_attribute("href")
-            info["link"] = href.split('?')[0] if href else "#"
+            if not href: continue
             
-            # Próba pobrania nazwy z linku lub nagłówka
-            heading = await element.query_selector('[data-testid="title"], h3, h4, .sr-hotel__name')
-            if heading:
-                info["name"] = await heading.inner_text()
-            else:
-                info["name"] = "Oferta Booking"
-        else:
-            info["link"] = "#"
-            info["name"] = "Oferta bez linku"
+            # Czysty link bez parametrów śledzących
+            clean_link = href.split('?')[0]
+            if clean_link in seen_links: continue
+            
+            # Pobieramy tekst całego kontenera (rodzica), w którym jest link
+            # Wspinamy się 3 poziomy w górę, żeby złapać cenę i nazwę
+            # To jest ryzykowne, ale skuteczne w chmurze
+            card_context = await link_el.evaluate_handle('el => el.closest("div[data-testid=\'property-card\']") || el.closest("div[role=\'listitem\']") || el.parentElement.parentElement.parentElement')
+            
+            if not card_context: continue
+            
+            full_text = await card_context.inner_text()
+            text_lower = full_text.lower()
+            
+            # --- CENA ---
+            price_val = 0.0
+            # Szukamy liczb w sąsiedztwie "zł" lub "PLN"
+            matches = re.findall(r'(?:PLN|zł)\s*([\d\s]+)|([\d\s]+)\s*(?:PLN|zł)', full_text, re.IGNORECASE)
+            for m in matches:
+                val_str = m[0] if m[0] else m[1]
+                clean = re.sub(r'\s+', '', val_str)
+                if clean.isdigit():
+                    val = float(clean)
+                    if val > 50: # Odrzucamy śmieci poniżej 50 zł
+                        price_val = val
+                        break # Bierzemy pierwszą napotkaną (zazwyczaj główną) cenę
+            
+            if price_val == 0: continue # Nie ma ceny = nie ma oferty
+            
+            # --- DYSTANS ---
+            dist_val = 0.0
+            dist_match = re.search(r'(\d+[.,]?\d*)\s*(km|m)\s', text_lower)
+            if dist_match:
+                d_val = float(dist_match.group(1).replace(',', '.'))
+                unit = dist_match.group(2)
+                if unit == "km": dist_val = d_val
+                elif unit == "m": dist_val = d_val / 1000.0
+            
+            # --- FILTRY ---
+            if dist_val > radius: continue
+            if filters["parking"] and "parking" not in text_lower: continue
+            if filters["sniadanie"] and not any(x in text_lower for x in ["śniadanie", "breakfast", "wliczone"]): continue
+            if filters["klima"] and not any(x in text_lower for x in ["klimatyzacja", "klimatyzowany", "ac"]): continue
 
-        return info
-    except:
-        return None
+            # --- NAZWA ---
+            # Próbujemy znaleźć nagłówek w tym samym kontenerze
+            name = "Nieznany Obiekt"
+            # Szukamy elementu z dużą czcionką lub h3/h4
+            try:
+                name_el = await card_context.query_selector('h3, [data-testid="title"]')
+                if name_el: name = await name_el.inner_text()
+            except: pass
+
+            seen_links.add(clean_link)
+            
+            if clean_link.startswith('http'): full_link = clean_link
+            else: full_link = f"https://www.booking.com{clean_link}"
+
+            results.append({
+                "price": price_val,
+                "dist": dist_val,
+                "name": name,
+                "link": full_link,
+                "text": text_lower # do debugu
+            })
+            
+        except Exception as e:
+            continue
+
+    return results
 
 async def run_autopilot(address, radius, start_date, end_date, filters, progress_bar, status_text, image_spot, list_placeholder):
     twoje_fotki = pobierz_twoje_zdjecia()
@@ -103,12 +134,19 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
     unique_competitors = {} 
     
     async with async_playwright() as p:
+        # Ustawiamy dużą rozdzielczość (viewport), żeby Booking myślał, że to duży monitor
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
+            args=[
+                "--no-sandbox", 
+                "--disable-dev-shm-usage", 
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1920,1080"
+            ]
         )
         context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080},
             locale="pl-PL"
         )
         page = await context.new_page()
@@ -134,59 +172,31 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
                    f"&order=distance_from_search&lang=pl")
 
             try:
-                await page.goto(url, timeout=60000)
+                await page.goto(url, timeout=90000)
                 
-                # Zamykanie popupów (cicha próba)
-                try: await page.click('#onetrust-accept-btn-handler', timeout=2000)
+                # Zamykanie popupów
+                try: await page.click('#onetrust-accept-btn-handler', timeout=3000)
                 except: pass
                 
-                # Przewijanie
-                await page.evaluate("window.scrollTo(0, 2000)")
-                await page.wait_for_timeout(2000)
+                # Przewijanie (ważne!)
+                for _ in range(3):
+                    await page.evaluate("window.scrollBy(0, 1000)")
+                    await page.wait_for_timeout(1000)
 
-                # --- NOWA STRATEGIA: Pobierz wszystkie możliwe kontenery ---
-                # Zamiast szukać konkretnych klas, szukamy wszystkich elementów listy wyników
-                elements = await page.query_selector_all('[data-testid="property-card"]')
+                # --- NOWA STRATEGIA AGRESYWNA ---
+                offers = await parse_page_aggressive(page, radius, filters)
                 
-                # Jeśli standardowe karty nie działają, szukamy generycznych bloków
-                if not elements:
-                    elements = await page.query_selector_all('div[role="listitem"]')
-                
-                # Jeśli nadal nic, szukamy po prostu bloków z ceną (ostateczność)
-                if not elements:
-                    # To bardzo szeroki selektor, ale w chmurze może być jedynym ratunkiem
-                    # Szukamy divów, które mają klasę zawierającą 'item' lub 'card'
-                    elements = await page.query_selector_all("div[class*='item'], div[class*='card']")
-
                 valid_prices = []
-                
-                # Skanujemy max 60 elementów (żeby nie muliło)
-                for el in elements[:60]:
-                    data = await parse_element_content(el)
-                    if data:
-                        # Filtr promienia
-                        if data["dist_val"] > radius: continue
-                        
-                        # Filtry udogodnień
-                        if filters["parking"] and "parking" not in data["text"]: continue
-                        if filters["sniadanie"] and not any(x in data["text"] for x in ["śniadanie", "breakfast", "wliczone"]): continue
-                        if filters["klima"] and not any(x in data["text"] for x in ["klimatyzacja", "klimatyzowany", "ac"]): continue
-                        
-                        valid_prices.append(data["price"])
-                        
-                        # Zapisujemy do listy konkurencji
-                        if data["link"] not in unique_competitors:
-                            link = data['link']
-                            if link.startswith('http'): full_link = link
-                            else: full_link = f"https://www.booking.com{link}"
-                                
-                            unique_competitors[data["link"]] = {
-                                "Nazwa": data["name"],
-                                "Link": full_link,
-                                "Dystans": f"{data['dist_val']:.2f} km"
-                            }
+                for o in offers:
+                    valid_prices.append(o["price"])
+                    if o["link"] not in unique_competitors:
+                        unique_competitors[o["link"]] = {
+                            "Nazwa": o["name"],
+                            "Link": o["link"],
+                            "Dystans": f"{o['dist']:.2f} km"
+                        }
 
-                list_placeholder.caption(f"Znaleziono {len(unique_competitors)} konkurentów...")
+                list_placeholder.caption(f"Znaleziono {len(unique_competitors)} unikalnych ofert...")
 
                 if valid_prices:
                     avg = int(sum(valid_prices) / len(valid_prices))
@@ -216,9 +226,8 @@ col1, col2 = st.columns([1, 3])
 with col1:
     st.subheader("📍 Ustawienia")
     address = st.text_input("Adres:", "Szeroka 10, Toruń")
-    
-    # ZMIANA: Zmieniony 'label' wymusi odświeżenie domyślnej wartości na 3.0
-    radius = st.number_input("Promień szukania (km):", 0.1, 15.0, 3.0, 0.1)
+    # Reset suwaka do 3.0 przez zmianę key/label
+    radius = st.number_input("Promień (km):", 0.1, 15.0, 3.0, 0.1)
     
     dates = st.date_input("Zakres dat:", (date.today(), date.today() + timedelta(days=7)))
     
@@ -251,7 +260,7 @@ if btn:
         if dane_dni:
             df = pd.DataFrame(dane_dni)
             df_comp = pd.DataFrame(dane_konkurencji)
-            status.success("Analiza zakończona!")
+            status.success("Gotowe!")
             
             st.subheader("Wykres")
             fig = px.line(df, x="Data", y=["Średnia Rynkowa", "Twoja Cena"], markers=True, color_discrete_map={"Średnia Rynkowa": "blue", "Twoja Cena": "red"})
@@ -275,4 +284,4 @@ if btn:
                 c1.download_button("💾 Kalendarz (CSV)", df.to_csv(index=False, sep=';').encode('utf-8-sig'), "KALENDARZ.csv", "text/csv")
                 if not df_comp.empty: c2.download_button("💾 Lista (CSV)", df_comp.to_csv(index=False, sep=';').encode('utf-8-sig'), "LISTA.csv", "text/csv")
         else:
-            status.error("Brak danych (lub Booking zablokował połączenie).")
+            status.error("Brak danych.")
