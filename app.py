@@ -44,33 +44,45 @@ async def parse_card_content(card):
         full_text = await card.inner_text()
         info["text"] = full_text.lower()
         
-        # --- BARDZIEJ ELASTYCZNE SZUKANIE CENY ---
-        # Szukamy czegokolwiek co ma cyfry i "zł" lub "PLN"
-        price_txt = None
+        # --- PANCERNE SZUKANIE CENY ---
+        price_val = None
+        
         # Metoda 1: Standardowy selektor
         price_el = await card.query_selector('[data-testid="price-and-discounted-price"]')
         if price_el:
             price_txt = await price_el.inner_text()
-        else:
-            # Metoda 2: Szukanie po tekście wewnątrz karty (Regex)
-            # Szuka ciągu typu: "1 200 zł" lub "450PLN"
-            match = re.search(r'(\d[\d\s]*)(zł|PLN)', full_text, re.IGNORECASE)
-            if match:
-                price_txt = match.group(0)
+            # Czyścimy wszystko co nie jest cyfrą
+            price_val = float(re.sub(r'[^\d]', '', price_txt))
+        
+        # Metoda 2: Jeśli Metoda 1 zawiodła, szukamy w całym tekście karty
+        if not price_val:
+            # Szukamy wzorców: "200 zł", "PLN 200", "200 PLN"
+            # Ignorujemy spacje w liczbach (np. 1 200)
+            matches = re.findall(r'(?:PLN|zł)\s*([\d\s]+)|([\d\s]+)\s*(?:PLN|zł)', full_text, re.IGNORECASE)
+            for m in matches:
+                # m to krotka np. ('', '1 200') lub ('200', '')
+                txt_val = m[0] if m[0] else m[1]
+                # Usuwamy spacje i sprawdzamy czy to sensowna liczba
+                clean_val = re.sub(r'\s+', '', txt_val)
+                if clean_val.isdigit():
+                    val = float(clean_val)
+                    if val > 10: # Ignorujemy małe liczby (np. ocena 9.0, dystans 2.5)
+                        price_val = val
+                        break
 
-        if price_txt:
-            info["price"] = float(re.sub(r'[^\d]', '', price_txt))
+        if price_val:
+            info["price"] = price_val
         else:
-            return None # Bez ceny nie bierzemy
+            return None # Bez ceny oferta jest bezużyteczna
             
         # Nazwa
         title_el = await card.query_selector('[data-testid="title"]')
-        if not title_el: title_el = await card.query_selector('h3') # Fallback na nagłówek
-        info["name"] = await title_el.inner_text() if title_el else "Obiekt bez nazwy"
+        if not title_el: title_el = await card.query_selector('h3') 
+        info["name"] = await title_el.inner_text() if title_el else "Obiekt"
         
         # Link
         link_el = await card.query_selector('a[data-testid="title-link"]')
-        if not link_el: link_el = await card.query_selector('a') # Pierwszy link w karcie
+        if not link_el: link_el = await card.query_selector('a')
         
         if link_el:
             href = await link_el.get_attribute("href")
@@ -79,8 +91,8 @@ async def parse_card_content(card):
             info["link"] = "#"
         
         # Dystans
-        distance_el = await card.query_selector('[data-testid="distance"]')
         info["dist_val"] = 0.0
+        distance_el = await card.query_selector('[data-testid="distance"]')
         if distance_el:
             dist_txt = await distance_el.inner_text()
             nums = re.findall(r"(\d+[.,]?\d*)", dist_txt)
@@ -102,7 +114,11 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
+            args=[
+                "--no-sandbox", 
+                "--disable-dev-shm-usage", 
+                "--disable-blink-features=AutomationControlled"
+            ]
         )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -131,43 +147,55 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
                    f"&order=distance_from_search&lang=pl")
 
             try:
-                await page.goto(url, timeout=60000)
+                await page.goto(url, timeout=90000) # Wydłużony timeout
                 
-                # Zamknięcie ciasteczek
-                try: await page.click('#onetrust-accept-btn-handler', timeout=3000)
+                # Zamykanie popupów
+                try: 
+                    # Szukamy przycisków zawierających słowa kluczowe
+                    await page.click('button:has-text("Akceptuj")', timeout=2000)
+                    await page.click('button:has-text("Accept")', timeout=500)
                 except: pass
-
-                # Czekamy na załadowanie DOM (struktury strony)
-                await page.wait_for_load_state("domcontentloaded")
                 
-                # Scrollujemy powoli, żeby wywołać ładowanie elementów
-                await page.evaluate("window.scrollTo(0, 1000)")
-                await page.wait_for_timeout(1000)
+                # KLUCZOWE: Czekamy na "ciszę w sieci" (aż strona przestanie ładować dane)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except: pass # Jeśli timeout, idziemy dalej
+
                 await page.evaluate("window.scrollTo(0, 2000)")
                 await page.wait_for_timeout(2000)
 
-                # --- NOWA STRATEGIA POBIERANIA KART ---
-                # Próbujemy znaleźć cokolwiek co wygląda jak karta
+                # --- STRATEGIA ZBIERANIA KART (Potrójna) ---
+                cards = []
+                # 1. Standardowy ID
                 cards = await page.query_selector_all('[data-testid="property-card"]')
                 
-                # Jeśli standardowa metoda zawiedzie, szukamy po roli (listitem)
-                if len(cards) == 0:
-                    status_text.info("⚠️ Próbuję alternatywnej metody szukania...")
+                # 2. Jeśli pusto -> szukaj po roli
+                if not cards:
                     cards = await page.query_selector_all('div[role="listitem"]')
                 
-                # DIAGNOSTYKA
-                if len(cards) == 0:
-                    status_text.error(f"⚠️ Dzień {s1}: Nadal 0 kart. Robię zdjęcie błędu.")
+                # 3. Jeśli nadal pusto -> szukaj kontenerów z cenami
+                if not cards:
+                    # Szukamy elementów, które mają w sobie cenę, i bierzemy ich rodzica (kartę)
+                    # To jest ryzykowne, ale tonący brzytwy się chwyta
+                    cards = await page.query_selector_all('.sr_item') # Stary selektor
+
+                # DIAGNOSTYKA BŁĘDU (Zrzut ekranu jeśli 0 kart)
+                if not cards:
+                    status_text.warning(f"⚠️ Dzień {s1}: Nadal 0 kart. Robię zdjęcie do weryfikacji.")
                     await page.screenshot(path="debug_error.png")
                     with image_spot.container():
-                        st.image("debug_error.png", caption="Nadal brak wyników", use_container_width=True)
+                        st.image("debug_error.png", caption="Błąd: Brak widocznych ofert", use_container_width=True)
                 
                 valid_prices = []
                 
-                for c in cards[:40]:
+                # Analizujemy znalezione karty
+                for c in cards[:50]: # Zwiększyłem limit do 50
                     data = await parse_card_content(c)
                     if data:
+                        # Filtr dystansu
                         if data["dist_val"] > radius: continue
+                        
+                        # Filtry tekstowe
                         if filters["parking"] and "parking" not in data["text"]: continue
                         if filters["sniadanie"] and not any(x in data["text"] for x in ["śniadanie", "breakfast", "wliczone"]): continue
                         if filters["klima"] and not any(x in data["text"] for x in ["klimatyzacja", "klimatyzowany", "ac"]): continue
@@ -215,7 +243,8 @@ col1, col2 = st.columns([1, 3])
 with col1:
     st.subheader("📍 Ustawienia")
     address = st.text_input("Adres:", "Szeroka 10, Toruń")
-    radius = st.number_input("Promień (km):", 0.1, 5.0, 0.5, 0.1)
+    # ZMIANA: Domyślna wartość 3.0
+    radius = st.number_input("Promień (km):", 0.1, 10.0, 3.0, 0.1)
     dates = st.date_input("Zakres dat:", (date.today(), date.today() + timedelta(days=7)))
     
     st.markdown("---")
