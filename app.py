@@ -1,12 +1,30 @@
 import streamlit as st
 import asyncio
-from playwright.async_api import async_playwright
+# --- AUTO-INSTALACJA PRZEGLĄDARKI (Fix dla Chmury) ---
+import os
+import subprocess
+import sys
+
+# Sprawdzamy, czy przeglądarka jest zainstalowana, jeśli nie - instalujemy ją
+# To kluczowy fragment, który naprawia błąd w Streamlit Cloud
+try:
+    from playwright.async_api import async_playwright
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
+
+# Wymuszamy instalację silnika Chromium przy każdym starcie w chmurze
+if not os.path.exists("playwright_installed.flag"):
+    print("🚑 Instaluję przeglądarkę Chromium dla bota...")
+    subprocess.run(["playwright", "install", "chromium"])
+    # Tworzymy pusty plik, żeby nie instalować przy każdym odświeżeniu strony, tylko przy restarcie serwera
+    with open("playwright_installed.flag", "w") as f:
+        f.write("installed")
+
 from datetime import date, timedelta
 import pandas as pd
 import plotly.express as px
 import io
 import re
-import os
 import random
 
 st.set_page_config(page_title="Autopilot Pro", page_icon="✈️", layout="wide")
@@ -26,7 +44,6 @@ st.markdown("""
 
 def pobierz_twoje_zdjecia():
     folder = "moje_zdjecia"
-    # Zabezpieczenie: jeśli folder nie istnieje w chmurze, nie wywalaj błędu
     if not os.path.exists(folder): return []
     return [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
@@ -70,12 +87,10 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
     unique_competitors = {} 
     
     async with async_playwright() as p:
-        # --- KLUCZOWA POPRAWKA DLA CHMURY ---
-        # 1. headless=True (musi być ukryte)
-        # 2. args (dodatkowe flagi stabilności dla serwerów Linux)
+        # --- KONFIGURACJA DLA CHMURY ---
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         )
         
         context = await browser.new_context(
@@ -104,7 +119,6 @@ async def run_autopilot(address, radius, start_date, end_date, filters, progress
                    f"&order=distance_from_search")
 
             try:
-                # Zwiększony timeout do 60s dla chmury
                 await page.goto(url, timeout=60000)
                 
                 try: await page.click('#onetrust-accept-btn-handler', timeout=2000)
